@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to release (for example v0.2.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  test-intel:
+    name: Test on Intel
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Check release version
+        shell: bash
+        run: |
+          TASK_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          if [[ "$RELEASE_TAG" != "v$TASK_VERSION" ]]; then
+            echo "Tag $RELEASE_TAG does not match app version v$TASK_VERSION" >&2
+            exit 1
+          fi
+      - name: Build and test
+        run: ./build.command
+
+  release:
+    name: Build and publish universal app
+    needs: test-intel
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Check release version
+        shell: bash
+        run: |
+          TASK_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          if [[ "$RELEASE_TAG" != "v$TASK_VERSION" ]]; then
+            echo "Tag $RELEASE_TAG does not match app version v$TASK_VERSION" >&2
+            exit 1
+          fi
+      - name: Build and test universal app
+        run: ./build.command --universal
+      - name: Check package
+        shell: bash
+        run: |
+          lipo 'dist/GO Tone Bridge.app/Contents/MacOS/GO Tone Bridge' -verify_arch arm64 x86_64
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+          ditto -x -k dist/GO-Tone-Bridge-macOS-universal.zip .build/unpacked
+          codesign --verify --deep --strict '.build/unpacked/GO Tone Bridge.app'
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TASK_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          if gh release view "$RELEASE_TAG" --json tagName >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/GO-Tone-Bridge-macOS-universal.zip dist/SHA256SUMS --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/GO-Tone-Bridge-macOS-universal.zip dist/SHA256SUMS \
+              --verify-tag --title "GO Tone Bridge $TASK_VERSION" --notes-file .github/release-notes.md --latest
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false
